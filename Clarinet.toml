@@ -1,0 +1,26 @@
+[project]
+name = "social-tipping-platform"
+description = "Social tipping platform for content creators with Chainhook integration for analytics"
+authors = ["Builder"]
+telemetry = false
+cache_dir = "./.cache"
+requirements = []
+
+[contracts.tip-manager]
+path = "contracts/tip-manager.clar"
+clarity_version = 4
+epoch = 3.3
+
+[contracts.creator-profiles]
+path = "contracts/creator-profiles.clar"
+clarity_version = 4
+epoch = 3.3
+
+[repl.analysis]
+passes = ["check_checker"]
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false

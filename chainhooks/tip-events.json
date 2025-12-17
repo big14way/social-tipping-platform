@@ -1,0 +1,38 @@
+{
+  "chain": "stacks",
+  "uuid": "tipping-events-tracker",
+  "name": "Social Tipping Event Tracker",
+  "version": 1,
+  "networks": {
+    "testnet": {
+      "if_this": {
+        "scope": "print_event",
+        "contract_identifier": "YOUR_DEPLOYER_ADDRESS.tip-manager",
+        "contains": "event"
+      },
+      "then_that": {
+        "http_post": {
+          "url": "http://localhost:3003/api/tip-events",
+          "authorization_header": "Bearer YOUR_AUTH_TOKEN"
+        }
+      },
+      "start_block": 1,
+      "decode_clarity_values": true
+    },
+    "mainnet": {
+      "if_this": {
+        "scope": "print_event",
+        "contract_identifier": "YOUR_MAINNET_ADDRESS.tip-manager",
+        "contains": "event"
+      },
+      "then_that": {
+        "http_post": {
+          "url": "https://your-api.com/api/tip-events",
+          "authorization_header": "Bearer YOUR_AUTH_TOKEN"
+        }
+      },
+      "start_block": 1,
+      "decode_clarity_values": true
+    }
+  }
+}
