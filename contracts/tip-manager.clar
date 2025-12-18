@@ -421,3 +421,4 @@
         })
         
         (ok true)))
+(define-data-var tip-var-1 uint u1)
