@@ -422,3 +422,4 @@
         
         (ok true)))
 (define-data-var tip-var-1 uint u1)
+(define-data-var tip-var-2 uint u2)
