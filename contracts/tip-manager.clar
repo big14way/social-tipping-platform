@@ -425,3 +425,4 @@
 (define-data-var tip-var-2 uint u2)
 (define-data-var tip-var-3 uint u3)
 (define-data-var tip-var-4 uint u4)
+(define-data-var tip-var-5 uint u5)
