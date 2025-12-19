@@ -15,6 +15,10 @@
 (define-constant ERR_CAMPAIGN_EXPIRED (err u22008))
 (define-constant ERR_CAMPAIGN_NOT_ACTIVE (err u22009))
 (define-constant ERR_INVALID_MULTIPLIER (err u22010))
+(define-constant ERR_SUBSCRIPTION_NOT_FOUND (err u22011))
+(define-constant ERR_SUBSCRIPTION_ACTIVE (err u22012))
+(define-constant ERR_SUBSCRIPTION_CANCELLED (err u22013))
+(define-constant ERR_PAYMENT_NOT_DUE (err u22014))
 
 ;; Protocol fee: 2.5% (250 basis points)
 (define-constant PROTOCOL_FEE_BPS u250)
@@ -36,6 +40,9 @@
 (define-data-var campaign-counter uint u0)
 (define-data-var total-boosted-tips uint u0)
 (define-data-var total-boost-multiplier-applied uint u0)
+(define-data-var subscription-counter uint u0)
+(define-data-var total-active-subscriptions uint u0)
+(define-data-var total-subscription-revenue uint u0)
 
 ;; ========================================
 ;; Data Maps
@@ -143,6 +150,29 @@
         campaigns-participated: uint,
         highest-single-boost: uint
     }
+)
+
+;; Recurring subscriptions
+(define-map subscriptions
+    uint
+    {
+        subscriber: principal,
+        creator: principal,
+        amount: uint,
+        interval-seconds: uint,
+        created-at: uint,
+        next-payment-due: uint,
+        total-payments: uint,
+        total-paid: uint,
+        active: bool,
+        cancelled-at: (optional uint)
+    }
+)
+
+;; Track subscriptions per subscriber-creator pair
+(define-map subscriber-to-creator
+    { subscriber: principal, creator: principal }
+    uint
 )
 
 ;; ========================================
@@ -689,3 +719,191 @@
         })
 
         (ok true)))
+
+;; ========================================
+;; Recurring Subscription Functions
+;; ========================================
+
+;; Create recurring subscription
+(define-public (create-subscription (creator principal) (amount uint) (interval-seconds uint))
+    (let ((existing-sub (map-get? subscriber-to-creator { subscriber: tx-sender, creator: creator }))
+          (profile (unwrap! (map-get? creators creator) ERR_CREATOR_NOT_FOUND))
+          (subscription-id (+ (var-get subscription-counter) u1))
+          (current-time stacks-block-time)
+          (next-payment (+ current-time interval-seconds)))
+        ;; Validations
+        (asserts! (>= amount MIN_TIP_AMOUNT) ERR_INVALID_AMOUNT)
+        (asserts! (>= interval-seconds u86400) ERR_INVALID_AMOUNT) ;; Min 1 day
+        (asserts! (is-none existing-sub) ERR_SUBSCRIPTION_ACTIVE)
+
+        ;; Create subscription
+        (map-set subscriptions subscription-id {
+            subscriber: tx-sender,
+            creator: creator,
+            amount: amount,
+            interval-seconds: interval-seconds,
+            created-at: current-time,
+            next-payment-due: next-payment,
+            total-payments: u0,
+            total-paid: u0,
+            active: true,
+            cancelled-at: none
+        })
+
+        ;; Link subscriber to creator
+        (map-set subscriber-to-creator { subscriber: tx-sender, creator: creator } subscription-id)
+
+        ;; Update counters
+        (var-set subscription-counter subscription-id)
+        (var-set total-active-subscriptions (+ (var-get total-active-subscriptions) u1))
+
+        ;; Emit event
+        (print {
+            event: "subscription-created",
+            subscription-id: subscription-id,
+            subscriber: tx-sender,
+            creator: creator,
+            amount: amount,
+            interval-seconds: interval-seconds,
+            next-payment-due: next-payment,
+            timestamp: current-time
+        })
+
+        (ok subscription-id)))
+
+;; Process subscription payment
+(define-public (process-subscription-payment (subscription-id uint))
+    (let ((subscription (unwrap! (map-get? subscriptions subscription-id) ERR_SUBSCRIPTION_NOT_FOUND))
+          (profile (unwrap! (map-get? creators (get creator subscription)) ERR_CREATOR_NOT_FOUND))
+          (current-time stacks-block-time)
+          (amount (get amount subscription))
+          (fee (calculate-fee amount))
+          (creator-amount (- amount fee))
+          (tip-id (+ (var-get tip-counter) u1)))
+        ;; Validations
+        (asserts! (get active subscription) ERR_SUBSCRIPTION_CANCELLED)
+        (asserts! (>= current-time (get next-payment-due subscription)) ERR_PAYMENT_NOT_DUE)
+
+        ;; Transfer subscription payment
+        (try! (stx-transfer? amount tx-sender (var-get contract-principal)))
+        (try! (stx-transfer? fee (var-get contract-principal) CONTRACT_OWNER))
+
+        ;; Record as tip
+        (map-set tips tip-id {
+            tipper: tx-sender,
+            creator: (get creator subscription),
+            content-id: none,
+            amount: creator-amount,
+            message: (some "Subscription payment"),
+            timestamp: current-time
+        })
+
+        ;; Update creator profile
+        (map-set creators (get creator subscription) (merge profile {
+            total-tips-received: (+ (get total-tips-received profile) u1),
+            total-amount-received: (+ (get total-amount-received profile) creator-amount),
+            pending-balance: (+ (get pending-balance profile) creator-amount)
+        }))
+
+        ;; Update subscription
+        (map-set subscriptions subscription-id (merge subscription {
+            next-payment-due: (+ (get next-payment-due subscription) (get interval-seconds subscription)),
+            total-payments: (+ (get total-payments subscription) u1),
+            total-paid: (+ (get total-paid subscription) amount)
+        }))
+
+        ;; Update stats
+        (var-set tip-counter tip-id)
+        (var-set total-tips-volume (+ (var-get total-tips-volume) amount))
+        (var-set total-fees-collected (+ (var-get total-fees-collected) fee))
+        (var-set total-subscription-revenue (+ (var-get total-subscription-revenue) creator-amount))
+
+        ;; Update tipper stats
+        (update-tipper-stats tx-sender amount fee)
+
+        ;; Emit events
+        (print {
+            event: "subscription-payment-processed",
+            subscription-id: subscription-id,
+            tip-id: tip-id,
+            subscriber: tx-sender,
+            creator: (get creator subscription),
+            amount: creator-amount,
+            fee: fee,
+            payment-number: (get total-payments subscription),
+            next-payment-due: (+ (get next-payment-due subscription) (get interval-seconds subscription)),
+            timestamp: current-time
+        })
+
+        (print {
+            event: "fee-collected",
+            tip-id: tip-id,
+            fee-type: "subscription",
+            amount: fee,
+            timestamp: current-time
+        })
+
+        (ok { tip-id: tip-id, next-payment-due: (+ (get next-payment-due subscription) (get interval-seconds subscription)) })))
+
+;; Cancel subscription
+(define-public (cancel-subscription (subscription-id uint))
+    (let ((subscription (unwrap! (map-get? subscriptions subscription-id) ERR_SUBSCRIPTION_NOT_FOUND)))
+        ;; Validations
+        (asserts! (is-eq tx-sender (get subscriber subscription)) ERR_NOT_AUTHORIZED)
+        (asserts! (get active subscription) ERR_SUBSCRIPTION_CANCELLED)
+
+        ;; Deactivate subscription
+        (map-set subscriptions subscription-id (merge subscription {
+            active: false,
+            cancelled-at: (some stacks-block-time)
+        }))
+
+        ;; Remove mapping
+        (map-delete subscriber-to-creator { subscriber: tx-sender, creator: (get creator subscription) })
+
+        ;; Update counter
+        (var-set total-active-subscriptions (- (var-get total-active-subscriptions) u1))
+
+        ;; Emit event
+        (print {
+            event: "subscription-cancelled",
+            subscription-id: subscription-id,
+            subscriber: tx-sender,
+            creator: (get creator subscription),
+            total-payments-made: (get total-payments subscription),
+            total-paid: (get total-paid subscription),
+            timestamp: stacks-block-time
+        })
+
+        (ok true)))
+
+;; Get subscription details
+(define-read-only (get-subscription (subscription-id uint))
+    (map-get? subscriptions subscription-id))
+
+;; Check if payment is due
+(define-read-only (is-payment-due (subscription-id uint))
+    (match (map-get? subscriptions subscription-id)
+        subscription {
+            is-due: (and (get active subscription)
+                        (>= stacks-block-time (get next-payment-due subscription))),
+            next-payment-due: (get next-payment-due subscription),
+            time-until-due: (if (> (get next-payment-due subscription) stacks-block-time)
+                              (- (get next-payment-due subscription) stacks-block-time)
+                              u0)
+        }
+        { is-due: false, next-payment-due: u0, time-until-due: u0 }))
+
+;; Get subscription by subscriber and creator
+(define-read-only (get-subscription-by-pair (subscriber principal) (creator principal))
+    (match (map-get? subscriber-to-creator { subscriber: subscriber, creator: creator })
+        sub-id (map-get? subscriptions sub-id)
+        none))
+
+;; Get subscription statistics
+(define-read-only (get-subscription-stats)
+    {
+        total-subscriptions: (var-get subscription-counter),
+        active-subscriptions: (var-get total-active-subscriptions),
+        total-revenue: (var-get total-subscription-revenue)
+    })
