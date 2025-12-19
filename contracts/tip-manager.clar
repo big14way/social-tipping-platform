@@ -11,6 +11,10 @@
 (define-constant ERR_INSUFFICIENT_BALANCE (err u22004))
 (define-constant ERR_ALREADY_REGISTERED (err u22005))
 (define-constant ERR_CONTENT_NOT_FOUND (err u22006))
+(define-constant ERR_CAMPAIGN_NOT_FOUND (err u22007))
+(define-constant ERR_CAMPAIGN_EXPIRED (err u22008))
+(define-constant ERR_CAMPAIGN_NOT_ACTIVE (err u22009))
+(define-constant ERR_INVALID_MULTIPLIER (err u22010))
 
 ;; Protocol fee: 2.5% (250 basis points)
 (define-constant PROTOCOL_FEE_BPS u250)
@@ -29,6 +33,9 @@
 (define-data-var total-fees-collected uint u0)
 (define-data-var total-creators uint u0)
 (define-data-var total-tippers uint u0)
+(define-data-var campaign-counter uint u0)
+(define-data-var total-boosted-tips uint u0)
+(define-data-var total-boost-multiplier-applied uint u0)
 
 ;; ========================================
 ;; Data Maps
@@ -100,6 +107,44 @@
     uint
 )
 
+;; Boost campaigns
+(define-map boost-campaigns
+    uint
+    {
+        name: (string-ascii 64),
+        description: (string-ascii 256),
+        multiplier: uint,
+        start-time: uint,
+        end-time: uint,
+        active: bool,
+        total-boosted-tips: uint,
+        total-participants: uint,
+        created-by: principal
+    }
+)
+
+;; Track boosted tips
+(define-map boosted-tips
+    uint
+    {
+        campaign-id: uint,
+        original-amount: uint,
+        boosted-amount: uint,
+        multiplier: uint
+    }
+)
+
+;; Track booster leaderboard
+(define-map booster-stats
+    principal
+    {
+        total-boosted-tips: uint,
+        total-boost-amount: uint,
+        campaigns-participated: uint,
+        highest-single-boost: uint
+    }
+)
+
 ;; ========================================
 ;; Read-Only Functions
 ;; ========================================
@@ -132,8 +177,33 @@
         total-volume: (var-get total-tips-volume),
         total-fees: (var-get total-fees-collected),
         total-content: (var-get content-counter),
+        total-campaigns: (var-get campaign-counter),
+        total-boosted-tips: (var-get total-boosted-tips),
         current-time: stacks-block-time
     })
+
+(define-read-only (get-campaign (campaign-id uint))
+    (map-get? boost-campaigns campaign-id))
+
+(define-read-only (get-boosted-tip-info (tip-id uint))
+    (map-get? boosted-tips tip-id))
+
+(define-read-only (get-booster-stats (booster principal))
+    (map-get? booster-stats booster))
+
+(define-read-only (is-campaign-active (campaign-id uint))
+    (match (map-get? boost-campaigns campaign-id)
+        campaign (and (get active campaign)
+                     (>= stacks-block-time (get start-time campaign))
+                     (< stacks-block-time (get end-time campaign)))
+        false))
+
+(define-read-only (calculate-boosted-amount (amount uint) (campaign-id uint))
+    (match (map-get? boost-campaigns campaign-id)
+        campaign (if (is-campaign-active campaign-id)
+                    (/ (* amount (get multiplier campaign)) u100)
+                    u0)
+        u0))
 
 ;; Generate creator info using to-ascii?
 (define-read-only (generate-creator-info (creator principal))
@@ -399,6 +469,204 @@
         
         (ok true)))
 
+;; Create boost campaign (admin only)
+(define-public (create-boost-campaign
+    (name (string-ascii 64))
+    (description (string-ascii 256))
+    (multiplier uint)
+    (duration uint))
+    (let
+        (
+            (campaign-id (+ (var-get campaign-counter) u1))
+            (current-time stacks-block-time)
+            (end-time (+ current-time duration))
+        )
+        ;; Validations
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (> multiplier u100) ERR_INVALID_MULTIPLIER)
+        (asserts! (<= multiplier u500) ERR_INVALID_MULTIPLIER)
+        (asserts! (> duration u3600) ERR_INVALID_AMOUNT)
+
+        ;; Create campaign
+        (map-set boost-campaigns campaign-id {
+            name: name,
+            description: description,
+            multiplier: multiplier,
+            start-time: current-time,
+            end-time: end-time,
+            active: true,
+            total-boosted-tips: u0,
+            total-participants: u0,
+            created-by: tx-sender
+        })
+
+        (var-set campaign-counter campaign-id)
+
+        ;; EMIT EVENT: campaign-created
+        (print {
+            event: "boost-campaign-created",
+            campaign-id: campaign-id,
+            name: name,
+            multiplier: multiplier,
+            start-time: current-time,
+            end-time: end-time,
+            timestamp: current-time
+        })
+
+        (ok campaign-id)))
+
+;; Send boosted tip
+(define-public (send-boosted-tip
+    (creator principal)
+    (amount uint)
+    (campaign-id uint)
+    (content-id (optional uint))
+    (message (optional (string-ascii 256))))
+    (let
+        (
+            (caller tx-sender)
+            (profile (unwrap! (map-get? creators creator) ERR_CREATOR_NOT_FOUND))
+            (campaign (unwrap! (map-get? boost-campaigns campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+            (tip-id (+ (var-get tip-counter) u1))
+            (current-time stacks-block-time)
+            (fee (calculate-fee amount))
+            (creator-amount (- amount fee))
+            (boost-amount (calculate-boosted-amount creator-amount campaign-id))
+            (total-creator-amount (+ creator-amount boost-amount))
+            (existing-support (default-to u0 (map-get? creator-supporters { creator: creator, supporter: caller })))
+            (current-booster-stats (default-to
+                { total-boosted-tips: u0, total-boost-amount: u0, campaigns-participated: u0, highest-single-boost: u0 }
+                (map-get? booster-stats caller)))
+        )
+        ;; Validations
+        (asserts! (>= amount MIN_TIP_AMOUNT) ERR_INVALID_AMOUNT)
+        (asserts! (is-campaign-active campaign-id) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (> boost-amount u0) ERR_CAMPAIGN_NOT_ACTIVE)
+
+        ;; Transfer tip (only base amount from tipper)
+        (try! (stx-transfer? amount caller (var-get contract-principal)))
+
+        ;; Transfer fee to protocol
+        (try! (stx-transfer? fee (var-get contract-principal) CONTRACT_OWNER))
+
+        ;; Record tip with boosted amount
+        (map-set tips tip-id {
+            tipper: caller,
+            creator: creator,
+            content-id: content-id,
+            amount: total-creator-amount,
+            message: message,
+            timestamp: current-time
+        })
+
+        ;; Record boost details
+        (map-set boosted-tips tip-id {
+            campaign-id: campaign-id,
+            original-amount: creator-amount,
+            boosted-amount: boost-amount,
+            multiplier: (get multiplier campaign)
+        })
+
+        ;; Update creator profile with boosted amount
+        (map-set creators creator (merge profile {
+            total-tips-received: (+ (get total-tips-received profile) u1),
+            total-amount-received: (+ (get total-amount-received profile) total-creator-amount),
+            pending-balance: (+ (get pending-balance profile) total-creator-amount),
+            supporter-count: (if (is-eq existing-support u0)
+                (+ (get supporter-count profile) u1)
+                (get supporter-count profile))
+        }))
+
+        ;; Update content stats if applicable
+        (match content-id
+            cid (match (map-get? content-items cid)
+                content (map-set content-items cid (merge content {
+                    tips-received: (+ (get tips-received content) u1),
+                    total-amount: (+ (get total-amount content) total-creator-amount)
+                }))
+                true)
+            true)
+
+        ;; Track supporter
+        (map-set creator-supporters { creator: creator, supporter: caller }
+            (+ existing-support total-creator-amount))
+
+        ;; Update campaign stats
+        (map-set boost-campaigns campaign-id (merge campaign {
+            total-boosted-tips: (+ (get total-boosted-tips campaign) u1),
+            total-participants: (+ (get total-participants campaign) u1)
+        }))
+
+        ;; Update booster stats
+        (map-set booster-stats caller (merge current-booster-stats {
+            total-boosted-tips: (+ (get total-boosted-tips current-booster-stats) u1),
+            total-boost-amount: (+ (get total-boost-amount current-booster-stats) boost-amount),
+            campaigns-participated: (+ (get campaigns-participated current-booster-stats) u1),
+            highest-single-boost: (if (> boost-amount (get highest-single-boost current-booster-stats))
+                                     boost-amount
+                                     (get highest-single-boost current-booster-stats))
+        }))
+
+        ;; Update counters
+        (var-set tip-counter tip-id)
+        (var-set total-tips-volume (+ (var-get total-tips-volume) amount))
+        (var-set total-fees-collected (+ (var-get total-fees-collected) fee))
+        (var-set total-boosted-tips (+ (var-get total-boosted-tips) u1))
+        (var-set total-boost-multiplier-applied (+ (var-get total-boost-multiplier-applied) boost-amount))
+
+        ;; Update tipper stats
+        (update-tipper-stats caller amount fee)
+
+        ;; EMIT EVENT: boosted-tip-sent
+        (print {
+            event: "boosted-tip-sent",
+            tip-id: tip-id,
+            campaign-id: campaign-id,
+            tipper: caller,
+            creator: creator,
+            base-amount: creator-amount,
+            boost-amount: boost-amount,
+            total-amount: total-creator-amount,
+            multiplier: (get multiplier campaign),
+            fee: fee,
+            content-id: content-id,
+            has-message: (is-some message),
+            timestamp: current-time
+        })
+
+        ;; EMIT EVENT: fee-collected
+        (print {
+            event: "fee-collected",
+            tip-id: tip-id,
+            fee-type: "boosted-tip",
+            amount: fee,
+            timestamp: current-time
+        })
+
+        (ok { tip-id: tip-id, boost-amount: boost-amount, total-amount: total-creator-amount })))
+
+;; Toggle campaign status (admin only)
+(define-public (toggle-campaign (campaign-id uint))
+    (let
+        (
+            (campaign (unwrap! (map-get? boost-campaigns campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+        )
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+
+        (map-set boost-campaigns campaign-id (merge campaign {
+            active: (not (get active campaign))
+        }))
+
+        ;; EMIT EVENT: campaign-toggled
+        (print {
+            event: "campaign-toggled",
+            campaign-id: campaign-id,
+            active: (not (get active campaign)),
+            timestamp: stacks-block-time
+        })
+
+        (ok (not (get active campaign)))))
+
 ;; ========================================
 ;; Admin Functions
 ;; ========================================
@@ -419,10 +687,5 @@
             creator: creator,
             timestamp: stacks-block-time
         })
-        
+
         (ok true)))
-(define-data-var tip-var-1 uint u1)
-(define-data-var tip-var-2 uint u2)
-(define-data-var tip-var-3 uint u3)
-(define-data-var tip-var-4 uint u4)
-(define-data-var tip-var-5 uint u5)
