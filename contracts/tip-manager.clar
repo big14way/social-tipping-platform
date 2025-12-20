@@ -907,3 +907,25 @@
         active-subscriptions: (var-get total-active-subscriptions),
         total-revenue: (var-get total-subscription-revenue)
     })
+
+;; Leaderboard tracking for top tippers and creators
+(define-map monthly-tip-totals { month: uint, tipper: principal } uint)
+(define-map monthly-creator-earnings { month: uint, creator: principal } uint)
+(define-data-var current-month uint u0)
+
+(define-private (get-current-month) (/ stacks-block-time u2592000))
+
+(define-public (record-tip-for-leaderboard (creator principal) (amount uint))
+    (let ((month (get-current-month))
+          (tipper-total (default-to u0 (map-get? monthly-tip-totals { month: month, tipper: tx-sender })))
+          (creator-total (default-to u0 (map-get? monthly-creator-earnings { month: month, creator: creator }))))
+        (map-set monthly-tip-totals { month: month, tipper: tx-sender } (+ tipper-total amount))
+        (map-set monthly-creator-earnings { month: month, creator: creator } (+ creator-total amount))
+        (print { event: "leaderboard-updated", month: month, tipper: tx-sender, creator: creator, amount: amount, timestamp: stacks-block-time })
+        (ok true)))
+
+(define-read-only (get-tipper-rank (month uint) (tipper principal))
+    (default-to u0 (map-get? monthly-tip-totals { month: month, tipper: tipper })))
+
+(define-read-only (get-creator-earnings (month uint) (creator principal))
+    (default-to u0 (map-get? monthly-creator-earnings { month: month, creator: creator })))
