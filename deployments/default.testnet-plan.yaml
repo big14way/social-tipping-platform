@@ -11,15 +11,22 @@ plan:
         - contract-publish:
             contract-name: creator-profiles
             expected-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            cost: 8587833
+            cost: 12134723
             path: contracts/creator-profiles.clar
             anchor-block-only: true
             clarity-version: 4
         - contract-publish:
             contract-name: tip-manager
             expected-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            cost: 8651183
+            cost: 12427283
             path: contracts/tip-manager.clar
+            anchor-block-only: true
+            clarity-version: 4
+        - contract-publish:
+            contract-name: tip-reputation
+            expected-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
+            cost: 12154372
+            path: contracts/tip-reputation.clar
             anchor-block-only: true
             clarity-version: 4
       epoch: "3.3"
