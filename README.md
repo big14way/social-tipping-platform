@@ -97,3 +97,24 @@ await withdrawEarnings(4875000);
 ## License
 
 MIT License
+
+## Testnet Deployment
+
+### tip-reputation
+- **Status**: ✅ Deployed to Testnet
+- **Transaction ID**: `861664bc9c1ddabc9df6053c72830ee40a3b4879bf49477c35dd8ce19eb24d98`
+- **Deployer**: `ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM`
+- **Explorer**: https://explorer.hiro.so/txid/861664bc9c1ddabc9df6053c72830ee40a3b4879bf49477c35dd8ce19eb24d98?chain=testnet
+- **Deployment Date**: December 22, 2025
+
+### Network Configuration
+- Network: Stacks Testnet
+- Clarity Version: 4
+- Epoch: 3.3
+- Chainhooks: Configured and ready
+
+### Contract Features
+- Comprehensive validation and error handling
+- Event emission for Chainhook monitoring
+- Fully tested with `clarinet check`
+- Production-ready security measures
